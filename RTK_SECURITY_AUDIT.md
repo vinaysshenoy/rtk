@@ -5,11 +5,13 @@
 RTK (Rust Token Killer) is a CLI proxy that filters and compresses command outputs to reduce LLM token consumption. This audit examines the codebase for hidden behavior, external data transmission, and security concerns.
 
 **Key findings:**
-- One outbound network path (optional telemetry, compile-time gated, now opt-in with GDPR consent)
+- One outbound network path (optional telemetry, compile-time gated, opt-in with GDPR consent)
 - Reads Claude Code session history files locally
 - Logs all commands to local SQLite database for 90 days
-- Installs preToolUse hooks that intercept commands across 6 AI coding agents
-- Two security fixes in v0.36.0 (compound command bypass, default verdict escalation)
+- Installs preToolUse hooks that intercept commands across 8 AI coding agents (v0.39.0: + Kilocode, Antigravity)
+- Two security fixes in v0.36.0 (compound command bypass, default verdict escalation) — verified still in place in v0.39.0
+- One bounded `unsafe` block for SIGINT/SIGTERM child-process cleanup (added 2026-04-04 — was missed by v0.36.0 audit, corrected here)
+- Three meta-commands (`rtk err`/`test`/`summary`) accept a free-form command and run it via `sh -c` — not exposed by the hook rewriter, no escalation, but worth disclosing
 - No backdoors, obfuscated code, or credential exfiltration found
 
 ---
@@ -20,6 +22,56 @@ RTK (Rust Token Killer) is a CLI proxy that filters and compresses command outpu
 |---------|------|---------|-------|
 | v0.35.0 | 2026-04-07 | Initial audit | Baseline (commit 8a7106c) |
 | v0.36.0 | 2026-04-16 | Re-audit | Privacy improvements, GDPR compliance, security fixes (commit a699357) |
+| v0.39.0 | 2026-05-08 | Re-audit | No new vulnerabilities. Two v0.36.0 baseline corrections (one `unsafe` block, three `sh -c` meta-command paths). New hook targets: Kilocode, Antigravity. (commit 9b9a78b) |
+
+---
+
+## v0.39.0 Re-audit Notes (2026-05-08)
+
+Re-audited the codebase against the v0.36.0 baseline using five parallel scoped audits (network, shell, hooks/permissions, local data, secrets/unsafe/artifacts). **No new vulnerabilities introduced.** Two factual corrections to the v0.36.0 baseline that were missed at the time:
+
+### Corrections to the v0.36.0 baseline
+
+1. **"Zero `sh -c` usage" claim was incorrect.** Three meta-commands (`rtk err`, `rtk test`, `rtk summary`) accept a free-form command string and execute it via `sh -c` (Unix) / `cmd /C` (Windows):
+   - `src/cmds/rust/runner.rs:101-111` — `build_shell_command()`
+   - `src/cmds/system/summary.rs:18-26`
+
+   Both files predate the v0.36.0 audit (added 2026-03-24) and were missed during that pass. **Severity: Low.** No privilege escalation: only invoked by explicit user-typed `rtk err/test/summary <cmd>`. The hook rewriter (`src/discover/registry.rs`) does not route any command into these — verified by `grep -n '"rtk err\|"rtk summary' src/discover/registry.rs` (returns only `rtk read`, `rtk pnpm`, `rtk npm` rewrites). A user who runs `rtk summary "x; rm -rf /"` could equivalently type `x; rm -rf /` directly — same trust boundary.
+
+2. **"Zero `unsafe` blocks" claim was incorrect.** `src/main.rs:2217-2240` contains a bounded `unsafe extern "C" fn handle_signal` + `libc::signal` block, used to kill child processes on SIGINT/SIGTERM (issue #897 — `panic = "abort"` profile makes `Drop`-based cleanup unreliable). Added 2026-04-04 (commit 33185101), 9 days before the v0.36.0 audit. Code quality is good — `#[allow(unsafe_code)]`, `nosemgrep` annotation, cfg-gated to Unix, single-purpose orphan-cleanup. Bounded FFI surface, no real risk; just doc drift.
+
+### Net-new in v0.39.0
+
+| Change | Where | Notes |
+|---|---|---|
+| Telemetry `meta_usage` field | `src/core/telemetry.rs:323-332` | Aggregate command-name counts (gain, discover, proxy, verify, learn, init); no PII |
+| Hook detection scans `.json` files | `src/core/telemetry.rs:350-379` | Existence check only; no execution |
+| 2 new agent integrations | Kilocode (`hooks/kilocode/rules.md`), Antigravity (`hooks/antigravity/rules.md`) | Same trust/integrity model as Windsurf/Cline; text-only via `include_str!` |
+| `glab` GitLab CLI command | `src/cmds/git/glab_cmd.rs` | Safe `Command::new().arg()` per arg |
+| Stream filter | `src/cmds/system/stream*` | All `Command::new("sh")` calls inside `#[cfg(test)]` fixtures |
+| Discover path encoder hardened | `src/discover/provider.rs:67-79` | Now sanitizes `.`, `_`, `\`, non-ASCII (commits 2d031f3, 73a05c3, 323cc3d) |
+| `tracking.commands.project_path` | `src/core/tracking.rs:43` | Uses `canonicalize()` — symlink-safe |
+| `gain --project` flag | `src/analytics/gain.rs:58` | GLOB pattern (not LIKE) — injection-safe |
+
+### v0.36.0 invariants confirmed still true in v0.39.0
+
+- `ureq` remains the only network-capable dep; `Cargo.lock` shows no `tokio`/`reqwest`/`hyper`/`mio`/`async-std`
+- Compound-command fix #1213 — verified at `permissions.rs:37-79` + 5 dedicated tests at lines 598-644
+- Default-verdict fix #1155 — verified at `rewrite_cmd.rs:37-41` + 6 dedicated tests at lines 105-160
+- Heredoc exclusion handles `<<EOF`, `<<'EOF'`, `<<-EOF`, `<<<` (here-string), heredoc-in-quotes
+- Hook integrity SHA-256 stored read-only (mode 0o444); CI-only override on `RTK_TRUST_PROJECT_FILTERS`
+- Audit log injection-protected (`hook_cmd.rs:255-261` `sanitize_log_field` escapes `\n`/`\r`/`|`/`\\`)
+- Telemetry: opt-in consent gate, compile-time URL gating, anonymous device hash (salt-only), GDPR `forget` deletes salt + ping marker + tracking DB
+- 90-day SQLite retention, GLOB (not LIKE) for path filtering
+- Zero `include_bytes!`, no vendored binaries, no submodules, no `.cargo/config.toml`
+- `build.rs` only concatenates filter TOMLs + sets Windows stack size — no downloads or native compilation
+
+### Hardening suggestions (not findings)
+
+1. **Expand env-var masking** in `src/cmds/system/env_cmd.rs` — add: `pat`, `bearer`, `passphrase`, `signing_key`, `webhook_secret`, `client_secret`, `refresh_token`, `oauth`, `pem`, plus CI tokens (`npm_token`, `cargo_registry_token`, `crates_io_token`, `circleci_token`, `codecov_token`, `buildkite_agent_access_token`).
+2. **Fix the quoting loss** in `Commands::Err`/`Test`/`Summary` — `command.join(" ")` (`main.rs:1599,1604,1720`) collapses argv into one string before `sh -c`, losing user quoting. Pass `Vec<String>` argv directly via `Command::new(argv[0]).args(&argv[1..])` instead. Eliminates the `sh -c` surface entirely as a side benefit.
+3. **Validate env-var path overrides** (`RTK_DB_PATH`, `RTK_TEE_DIR`, `RTK_AUDIT_DIR`) — reject `/dev/`, `/proc/`, and paths outside `$HOME` unless explicitly absolute and writable.
+4. **Snapshot verification commands** with each audit — include the exact `grep`/`find` commands used so the next audit can detect drift automatically.
 
 ---
 
@@ -360,9 +412,22 @@ Redaction replaces values with `[REDACTED]` before output.
 
 ## 7. Unsafe Code
 
-**v0.36.0: Zero `unsafe` blocks found in the entire Rust codebase.**
+**v0.39.0: One bounded `unsafe` block in `src/main.rs:2217-2240`.**
 
-> **v0.35.0** had a single `unsafe` block in `src/main.rs` (lines 2008-2011) for SIGINT/SIGTERM signal handling via `libc::signal`. This has been removed or refactored in v0.36.0.
+The block defines `unsafe extern "C" fn handle_signal` and calls `libc::signal` to register SIGINT/SIGTERM handlers that kill the child process on signal. This addresses issue #897 — the `panic = "abort"` release profile prevents `Drop`-based child cleanup from running on signal exit, leading to orphaned child processes.
+
+| Property | Value |
+|---|---|
+| Lines | `src/main.rs:2217-2240` |
+| Added | 2026-04-04 (commit 33185101) |
+| cfg gate | `#[cfg(unix)]` only |
+| Attributes | `#[allow(unsafe_code)]`, `// nosemgrep: unsafe-block` |
+| FFI surface | `libc::signal`, `libc::kill` |
+| Scope | Single static `AtomicU32` for child PID; signal handler reads PID and calls `kill()` |
+
+**Risk: minimal.** Bounded, single-purpose, no arbitrary FFI, no pointer arithmetic, no shared mutable state beyond an atomic.
+
+> **Correction to prior audits:** The v0.36.0 audit incorrectly claimed "Zero `unsafe` blocks." The signal handler was added on 2026-04-04, 9 days before the v0.36.0 audit was published, and was missed at that time. **v0.35.0** also had a similar block (then at lines 2008-2011) that was reported as removed; in fact the equivalent was reintroduced before v0.36.0 shipped.
 
 ---
 
@@ -438,9 +503,9 @@ No `reqwest`, `hyper`, `tokio`, `async-std`, or other async/networking crates. 7
 | **Credential exfiltration** | No | No | Env vars masked, secrets redacted in dotnet/AWS output |
 | **Backdoors** | None found | None found | No eval, no hidden endpoints, no obfuscated code |
 | **Shell config modification** | No | No | Uses AI agent native hook systems only |
-| **Unsafe code** | Minimal (2 lines) | **None** | Signal handler unsafe block removed |
+| **Unsafe code** | Minimal (2 lines) | 1 bounded block | Signal handler `unsafe extern "C" fn handle_signal` + `libc::signal` for orphan-process cleanup (issue #897). v0.36.0 audit incorrectly stated "None"; corrected in v0.39.0. |
 | **Async / background tasks** | 1 thread | 1 thread | Telemetry fire-and-forget only |
-| **Shell injection surface** | Clean | Clean | Zero `sh -c` / `bash -c` / `cmd /c` usage; all safe `Command::new().arg()` |
+| **Shell injection surface** | Clean | Mostly clean | Three meta-commands (`rtk err`/`test`/`summary`) execute user-supplied command strings via `sh -c` / `cmd /C`. No rewriter auto-routing → no escalation. v0.36.0 audit incorrectly stated "Zero `sh -c`"; corrected in v0.39.0. |
 
 ---
 
@@ -533,3 +598,4 @@ All via `include_str!()` (text only — no `include_bytes!()` used anywhere):
 
 *Initial audit performed on 2026-04-07 against RTK v0.35.0 (commit 8a7106c).*
 *Updated on 2026-04-16 against RTK v0.36.0 (commit a699357).*
+*Updated on 2026-05-08 against RTK v0.39.0 (commit 9b9a78b).*
